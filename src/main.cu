@@ -22,6 +22,7 @@ namespace {
 
 struct Options {
   std::vector<uint8_t> key;
+  bool have_key = false;
   std::vector<uint8_t> prefix;
   unsigned digits = 62;
   uint64_t start = 0;
@@ -43,7 +44,7 @@ void usage(const char* argv0) {
   std::printf(
       "usage: %s --key K [options]\n"
       "\n"
-      "  --key STR | --key-hex HEX     HMAC key (hex for binary keys)\n"
+      "  --key STR | --key-hex HEX     HMAC key (hex for binary keys); may be empty\n"
       "  --prefix STR | --prefix-hex H fixed message prefix before the counter\n"
       "  --digits N                    decimal digits required after \"0e\" (0..62, default 62)\n"
       "\n"
@@ -144,12 +145,14 @@ bool parse_args(int argc, char** argv, Options* o) {
       if (!need_value(argc, argv, &i, "--key", &v)) return false;
       o->key.assign(reinterpret_cast<const uint8_t*>(v), reinterpret_cast<const uint8_t*>(v) +
                                                             std::strlen(v));
+      o->have_key = true;
     } else if (a == "--key-hex") {
       if (!need_value(argc, argv, &i, "--key-hex", &v)) return false;
       if (!hex_decode(v, &o->key)) {
         std::fprintf(stderr, "bad --key-hex\n");
         return false;
       }
+      o->have_key = true;
     } else if (a == "--prefix") {
       if (!need_value(argc, argv, &i, "--prefix", &v)) return false;
       o->prefix.assign(reinterpret_cast<const uint8_t*>(v),
@@ -233,8 +236,8 @@ bool parse_args(int argc, char** argv, Options* o) {
       return false;
     }
   }
-  if (o->key.empty()) {
-    std::fprintf(stderr, "--key or --key-hex must give a non-empty key\n");
+  if (!o->have_key) {
+    std::fprintf(stderr, "--key or --key-hex is required\n");
     return false;
   }
   if (o->threads == 0 || o->threads > 256 || o->threads % 32) {
