@@ -2,10 +2,10 @@
 
 This is a tool to find a magic `0e\d` hash for HMAC-SHA256 using CUDA.
 
-tldr; we are looking for `$a` and `$b` here:
+tldr; we are looking for `$data` and `$key` here:
 
 ```php
-hash_hmac("sha256", $a, $b) == 0
+hash_hmac("sha256", $data, $key) == 0
 ```
 
 Intended uses: behavioral tests to ensure `hash_equals()` is used in the tested code. Or as a loose comparison regression guard.
