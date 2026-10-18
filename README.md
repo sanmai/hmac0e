@@ -8,9 +8,7 @@ tldr; we are looking for `$a` and `$b` here:
 hash_hmac("sha256", $a, $b) == 0
 ```
 
-Intended uses: behavioral tests to ensure `hash_equals()` or `===` are used in the tested code.
-
-It can't be used for anything nefarious because finding a magic hash like this requires knowing the key, and if you know the key, you don't need any magic hashes.
+Intended uses: behavioral tests to ensure `hash_equals()` is used in the tested code. Or as a loose comparison regression guard.
 
 ## Building
 
@@ -25,9 +23,7 @@ make check      # everything, including the GPU suite (needs a CUDA context)
 
 The default architecture is `sm_120`; for other GPUs, set an arch with `make ARCH=sm_86`.
 
-The prefix length must satisfy `((len + 12) % 64) <= 47`. The search space is the full 2^64 counter range.
-
-A `--digits 62` search covers ~1.16e15 candidates in expectation (probability `8.6e-16` per candidate) - about 30 hours at ~10 GH/s.
+A full search covers ~1.16e15 candidates; assuming the probability `8.6e-16` per candidate it should take about 30 hours at ~10 GH/s.
 
 ## Running
 
@@ -78,3 +74,5 @@ strict comparisons:
 bool(false)
 bool(true)
 ```
+
+It can't be used for anything nefarious because finding a magic hash like this requires knowing the key, and if you know the key, you don't need any magic hashes.
