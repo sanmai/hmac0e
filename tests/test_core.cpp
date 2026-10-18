@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "hmac0e.cuh"
+#include "launch_range.cuh"
 
 static int g_checks = 0;
 static int g_failures = 0;
@@ -46,7 +47,10 @@ static void fill_pseudo(std::vector<uint8_t>& v) {
   }
 }
 
-// The window-local counter as 8 zero-padded ASCII digits.
+// The counter becomes the 8 zero-padded ASCII digits the kernel varies, most
+// significant first. The oracles here share window_prefix and body_of with the
+// search, so they cannot catch a bug in the body format; the published-fixture
+// test anchors that format to a value produced outside this code base.
 static void put_ascii8(uint8_t* p, uint64_t c) {
   for (int i = 7; i >= 0; --i) {
     p[i] = uint8_t('0' + c % 10u);
@@ -54,10 +58,10 @@ static void put_ascii8(uint8_t* p, uint64_t c) {
   }
 }
 
-// The window baked into the contexts below: the largest real window, so the
-// leading 12 digits are nonzero (window 0, i.e. all-zeros, is covered by the
-// end-to-end shape test).
-const char* const kWindow12 = "018446744073";
+// The window baked into the contexts below: a large real window, so the leading
+// 12 digits are nonzero (window 0, i.e. all-zeros, is covered by the end-to-end
+// shape test and by the published fixture).
+const uint64_t kWindowNumber = 18446744073ull;
 
 // Nibble `pos` of the digest as written in hex, 0 = most significant.
 static void set_nibble(uint32_t d[8], unsigned pos, unsigned v) {
@@ -232,8 +236,7 @@ static void test_hoisting() {
       std::vector<uint8_t> prefix(plen);
       fill_pseudo(prefix);
       // Windowed search: the context is built over prefix || leading-12-digits.
-      std::vector<uint8_t> eff = prefix;
-      for (const char ch : std::string(kWindow12)) eff.push_back(uint8_t(ch));
+      const std::vector<uint8_t> eff = window_prefix(prefix, kWindowNumber);
 
       HmacCtx ctx;
       const char* err = nullptr;
@@ -287,10 +290,7 @@ static void test_end_to_end_shape() {
   std::printf("end-to-end search shape\n");
   const auto key = str("session-secret");
   const auto prefix = str("user=42&action=export&nonce=");
-  const char* const zeros12 = "000000000000";  // window 0
-  // The context is built over prefix || leading-12-digits, like the search.
-  std::vector<uint8_t> eff = prefix;
-  eff.insert(eff.end(), zeros12, zeros12 + 12);
+  const std::vector<uint8_t> eff = window_prefix(prefix, 0);  // window 0
   HmacCtx ctx;
   const char* err = nullptr;
   if (!hmac_ctx_build(key.data(), key.size(), eff.data(), eff.size(), &ctx, &err)) {
@@ -299,8 +299,7 @@ static void test_end_to_end_shape() {
   }
   int bad = 0;
   for (uint64_t c = 0; c < 500; ++c) {
-    std::vector<uint8_t> msg = prefix;
-    msg.insert(msg.end(), zeros12, zeros12 + 12);
+    std::vector<uint8_t> msg = eff;
     msg.resize(msg.size() + 8);
     put_ascii8(msg.data() + msg.size() - 8, c);
     uint32_t want[8] = {0};
@@ -310,6 +309,131 @@ static void test_end_to_end_shape() {
     if (hex(want) != hex(got)) ++bad;
   }
   check(bad == 0, "500 sequential counters, " + std::to_string(bad) + " mismatches");
+}
+
+// The published fixture: a real key, prefix, counter, and digest, taken from a
+// completed search and verified with PHP's hash_hmac. It is the only externally
+// fixed statement of the body format, so it pins the whole CPU pipeline: the
+// 20-digit layout, the window split, the hoisted candidate path, and the
+// predicate all have to agree with a value produced outside this code base.
+static void test_published_fixture() {
+  std::printf("published fixture\n");
+  const auto key = str("hmac-sha256-magic-hash-key");
+  const auto prefix = str("magic-hash-");
+  const uint64_t counter = 434871031216900ull;
+  const char* const want_body = "magic-hash-00000434871031216900";
+  const char* const want_digest =
+      "0e54716623902408569054496933889872294553517404006854343223678539";
+
+  const std::string body = body_of(prefix, counter);
+  check(body == want_body, "body_of -> " + body);
+
+  uint32_t d[8] = {0};
+  hmac_sha256(key.data(), key.size(), reinterpret_cast<const uint8_t*>(body.data()), body.size(),
+              d);
+  check(hex(d) == want_digest, "fixture digest -> " + hex(d));
+  check(magic_ok(d, 62), "fixture satisfies the full predicate");
+
+  // The search reaches the same body through a window context plus the local
+  // counter: window 4348710 fixes "000004348710" and the kernel writes 31216900.
+  const uint64_t window = counter / HMAC0E_WINDOW;
+  const uint64_t local = counter % HMAC0E_WINDOW;
+  check(window == 4348710ull && local == 31216900ull,
+        "window split " + std::to_string(window) + "/" + std::to_string(local));
+  const std::vector<uint8_t> eff = window_prefix(prefix, window);
+  const std::string eff_str(eff.begin(), eff.end());
+  check(eff_str == "magic-hash-000004348710", "window prefix -> " + eff_str);
+  check(body == eff_str + padded_dec(local, HMAC0E_COUNTER_DIGITS),
+        "window prefix plus local digits rebuild the body");
+
+  HmacCtx ctx;
+  const char* err = nullptr;
+  if (!hmac_ctx_build(key.data(), key.size(), eff.data(), eff.size(), &ctx, &err)) {
+    check(false, std::string("fixture ctx build failed: ") + err);
+    return;
+  }
+  uint32_t got[8] = {0};
+  hmac_candidate_any(ctx, local, got);
+  check(hex(got) == want_digest, "hoisted candidate reproduces the fixture -> " + hex(got));
+}
+
+// An empty key is a legal HMAC key, and an empty effective prefix is the
+// degenerate body of only the counter digits. Both hand a null pointer and a
+// zero length to memcpy in the naive implementation, which is undefined even
+// when nothing is copied, so both paths run here and get compared.
+static void test_empty_buffers() {
+  std::printf("empty key and empty prefix\n");
+  const std::vector<uint8_t> none;  // data() is null
+  const std::string digits = body_of(none, 7);
+  check(digits == "00000000000000000007", "body with no prefix is just 20 digits");
+
+  HmacCtx ctx;
+  const char* err = nullptr;
+  if (!hmac_ctx_build(none.data(), 0, none.data(), 0, &ctx, &err)) {
+    check(false, std::string("empty ctx build failed: ") + (err ? err : "?"));
+    return;
+  }
+  check(ctx.counter_word == 0 && ctx.counter_lane == 0, "empty prefix puts the slot at word 0");
+
+  // With no prefix the message is only the varying slot: a window's 12 fixed
+  // digits belong to the prefix that a real search supplies.
+  int bad = 0;
+  for (uint64_t c = 0; c < 16; ++c) {
+    const std::string msg = padded_dec(c, HMAC0E_COUNTER_DIGITS);
+    uint32_t want[8] = {0};
+    hmac_sha256(none.data(), 0, reinterpret_cast<const uint8_t*>(msg.data()), msg.size(), want);
+    uint32_t got[8] = {0};
+    hmac_candidate_any(ctx, c, got);
+    if (hex(want) != hex(got)) ++bad;
+  }
+  check(bad == 0, "16 empty-key candidates, " + std::to_string(bad) + " mismatches");
+}
+
+// The candidate-slice arithmetic is the only unsigned wrap-around logic in the
+// tool. It is pure, so it is tested here with no CUDA toolkit.
+static void test_launch_range() {
+  std::printf("launch ranges\n");
+  const uint64_t kWindow = HMAC0E_WINDOW;
+  const uint64_t cov = 1020ull * 256 * 512;  // the default grid, 133693440
+  check(cov > kWindow, "the default grid reaches past one window");
+
+  LaunchRange r = launch_range(0, cov, 0);
+  check(r.window == 0 && r.c0 == 0 && r.want == kWindow && !r.exhausted,
+        "first launch stops at the window end");
+  check(launch_range(0, 1000, 0).want == 1000, "a smaller grid limits the launch");
+  check(launch_range(0, cov, 4096).want == 4096, "--count limits the launch");
+
+  r = launch_range(kWindow - 1000, cov, 0);
+  check(r.window == 0 && r.c0 == kWindow - 1000 && r.want == 1000 && !r.exhausted,
+        "the tail of a window is not padded");
+  r = launch_range(kWindow - 1000, cov, 500);
+  check(r.want == 500, "--count wins over the rest of the window");
+  r = launch_range(kWindow, cov, 0);
+  check(r.window == 1 && r.c0 == 0 && r.want == kWindow && !r.exhausted,
+        "a window boundary starts a fresh window");
+
+  // The last window is partial: 2^64 is not a multiple of the window size.
+  const uint64_t last_window = UINT64_MAX / kWindow;   // 184467440737
+  const uint64_t last_start = last_window * kWindow;
+  const uint64_t tail = ~last_start + 1;               // 9551616
+  check(tail == 9551616, "the last window has 9551616 counters");
+  r = launch_range(last_start, cov, 0);
+  check(r.window == last_window && r.c0 == 0 && r.want == tail && r.exhausted,
+        "the last launch is capped by the counter space, not the window");
+  check(launch_range(last_start + 1000, cov, 0).want == tail - 1000,
+        "the partial window still limits the range");
+
+  r = launch_range(UINT64_MAX, cov, 0);
+  check(r.want == 1 && r.exhausted, "the final counter is scanned once");
+  check(r.window == last_window && r.c0 == tail - 1, "the final counter sits at the tail end");
+  r = launch_range(UINT64_MAX - 999, cov, 0);
+  check(r.want == 1000 && r.exhausted, "the launch that reaches 2^64 reports exhaustion");
+  r = launch_range(UINT64_MAX - 999, cov, 500);
+  check(r.want == 500 && !r.exhausted, "--count before the end is not exhaustion");
+
+  // 12 digits must represent every window index, or the leading digits would
+  // truncate and the kernel's slot would land in the wrong place.
+  check(last_window < 1000000000000ull, "every window index fits 12 digits");
 }
 
 // The whole search is compute-only: nothing per candidate lives in memory, so
@@ -331,6 +455,9 @@ int main() {
   test_magic_ok();
   test_hoisting();
   test_end_to_end_shape();
+  test_published_fixture();
+  test_empty_buffers();
+  test_launch_range();
   test_footprint();
   std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
   return g_failures == 0 ? 0 : 1;
