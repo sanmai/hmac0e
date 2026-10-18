@@ -1,0 +1,6 @@
+build/
+hmac0e
+*.o
+*.txt
+checkpoints/
+Makefile.local
