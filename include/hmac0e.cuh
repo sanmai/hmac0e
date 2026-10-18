@@ -26,22 +26,39 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <string>
+#include <vector>
 
 #include "sha256.cuh"
 
-// Counter word index inside the final inner block, 0..11. The kernel is
-// instantiated once per value so the block array keeps constant indices and
-// never spills to local memory.
-#define HMAC0E_MAX_COUNTER_WORD 11
+// The body format, defined once here because the search, the CLI, and every
+// test oracle have to agree on it byte for byte:
+//
+//   body = prefix || the counter as HMAC0E_BODY_DIGITS zero-padded decimal digits
+//
+// A window of HMAC0E_WINDOW counters fixes the leading HMAC0E_WINDOW_DIGITS of
+// that tail and leaves HMAC0E_COUNTER_DIGITS for the kernel to vary.
+#define HMAC0E_WINDOW 100000000ull
+#define HMAC0E_WINDOW_DIGITS 12
+#define HMAC0E_COUNTER_DIGITS 8
+#define HMAC0E_BODY_DIGITS (HMAC0E_WINDOW_DIGITS + HMAC0E_COUNTER_DIGITS)
+
+// The largest uint64 counter, 18446744073709551615, has exactly 20 digits, so
+// the padded tail never truncates and the leading digits always split as
+// declared above.
+static_assert(HMAC0E_BODY_DIGITS == 20, "a uint64 counter needs exactly 20 decimal digits");
 
 struct HmacCtx {
   uint32_t inner[8];        // chained state after all hoisted inner blocks
   uint32_t outer[8];        // chained state after the opad block
   uint32_t tail[16];        // final inner block template, counter slot zeroed
   uint32_t outer_tail[8];   // words 8..15 of the final outer block
-  uint32_t counter_word;    // 0..11
+  // Byte offset of the counter slot as a word index and a lane within it. The
+  // kernel is instantiated once per word index so the block array keeps
+  // constant indices and never spills to local memory; hmac_ctx_build only
+  // accepts lanes that fit the two-compression floor, so the word is 0..11.
+  uint32_t counter_word;
   uint32_t counter_lane;    // 0..3, byte offset of the counter inside that word
-  uint32_t inner_blocks;    // hoisted inner block count, informational
 };
 
 struct Hit {
@@ -152,6 +169,47 @@ HMAC0E_HD inline bool magic_ok(const uint32_t d[8], unsigned digits) {
   return true;
 }
 
+// Host-only helpers for the body format above. The device path assembles its
+// eight ASCII digits arithmetically inside hmac_candidate; these are the host
+// views of the same layout, shared by the search, the CLI output, and the test
+// oracles so that only one definition of "the body" exists.
+
+// v as exactly `width` zero-padded decimal digits; v must be < 10^width.
+inline void digits_to_dec(uint64_t v, unsigned width, char* out) {
+  for (int i = int(width) - 1; i >= 0; --i) {
+    out[i] = char('0' + v % 10u);
+    v /= 10u;
+  }
+}
+
+inline std::string padded_dec(uint64_t v, unsigned width) {
+  std::string s(size_t(width), '0');
+  digits_to_dec(v, width, &s[0]);
+  return s;
+}
+
+// The message body for a counter: prefix || 20 digits. May contain NUL bytes
+// when the prefix does, so always use its size(), not strlen.
+inline std::string body_of(const std::vector<uint8_t>& prefix, uint64_t counter) {
+  std::string body;
+  if (!prefix.empty()) {
+    body.assign(reinterpret_cast<const char*>(prefix.data()), prefix.size());
+  }
+  const size_t n = body.size();
+  body.resize(n + HMAC0E_BODY_DIGITS);
+  digits_to_dec(counter, HMAC0E_BODY_DIGITS, &body[n]);
+  return body;
+}
+
+// The prefix a window's context is built over: prefix || the fixed leading
+// digits. The kernel supplies the remaining digits per candidate.
+inline std::vector<uint8_t> window_prefix(const std::vector<uint8_t>& prefix, uint64_t window) {
+  const std::string w = padded_dec(window, HMAC0E_WINDOW_DIGITS);
+  std::vector<uint8_t> eff = prefix;
+  eff.insert(eff.end(), w.begin(), w.end());
+  return eff;
+}
+
 inline void digest_to_hex(const uint32_t d[8], char out[65]) {
   static const char* kHex = "0123456789abcdef";
   for (int i = 0; i < 8; ++i) {
@@ -173,12 +231,14 @@ inline void hmac_sha256(const uint8_t* key, size_t keylen, const uint8_t* msg, s
     sha256::hash_bytes(key, keylen, out);
     for (int i = 0; i < 8; ++i) sha256::put_be32(kb + i * 4, out[i]);
   } else {
-    std::memcpy(kb, key, keylen);
+    // Guarded for the empty key: passing a null pointer to memcpy is undefined
+    // even with a zero length, and an empty key is a legal HMAC key.
+    if (keylen > 0) std::memcpy(kb, key, keylen);
   }
 
   uint8_t* inner_in = new uint8_t[64 + msglen];
   for (int i = 0; i < 64; ++i) inner_in[i] = uint8_t(kb[i] ^ 0x36);
-  std::memcpy(inner_in + 64, msg, msglen);
+  if (msglen > 0) std::memcpy(inner_in + 64, msg, msglen);
   uint32_t inner[8];
   sha256::hash_bytes(inner_in, 64 + msglen, inner);
   delete[] inner_in;
@@ -208,7 +268,7 @@ inline bool hmac_ctx_build(const uint8_t* key, size_t keylen, const uint8_t* pre
     sha256::hash_bytes(key, keylen, h);
     for (int i = 0; i < 8; ++i) sha256::put_be32(kb + i * 4, h[i]);
   } else {
-    std::memcpy(kb, key, keylen);
+    if (keylen > 0) std::memcpy(kb, key, keylen);  // empty key: see above
   }
 
   uint8_t block[64];
@@ -219,20 +279,20 @@ inline bool hmac_ctx_build(const uint8_t* key, size_t keylen, const uint8_t* pre
   uint32_t words[16];
   for (int i = 0; i < 16; ++i) words[i] = sha256::be32(block + i * 4);
   sha256::compress(st, words);
-  ctx->inner_blocks = 1;
 
-  // Any further complete 64-byte blocks come straight from the prefix.
+  // Any further complete 64-byte blocks come straight from the prefix: the
+  // inner message is ipad || prefix || counter, so exactly
+  // 1 + floor(plen / 64) blocks precede the final one.
   for (size_t b = 0; b + 64 <= plen; b += 64) {
     for (int i = 0; i < 16; ++i) words[i] = sha256::be32(prefix + b + i * 4);
     sha256::compress(st, words);
-    ctx->inner_blocks += 1;
   }
   std::memcpy(ctx->inner, st, sizeof(st));
 
   // Final inner block: prefix tail, zeroed counter slot, 0x80, bit length.
   const size_t msglen = 64 + plen + 8;  // ipad || prefix || counter
   std::memset(block, 0, sizeof(block));
-  std::memcpy(block, prefix + (plen - lane), lane);
+  if (lane > 0) std::memcpy(block, prefix + (plen - lane), lane);
   block[lane + 8] = 0x80;
   const uint64_t bits = uint64_t(msglen) * 8;
   sha256::put_be32(block + 56, uint32_t(bits >> 32));

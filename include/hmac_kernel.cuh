@@ -5,13 +5,21 @@
 #include "hmac0e.cuh"
 
 #define HMAC0E_MAX_HITS 1024u
-#define HMAC0E_WINDOW 100000000ull
 
 struct HitBuffer {
   Hit* hits = nullptr;
   uint32_t* nhits = nullptr;
   uint32_t max_hits = HMAC0E_MAX_HITS;
 };
+
+// Counters that a grid of blocks x threads x per_thread reaches, or 0 when
+// blocks is 0 or the product does not fit in 64 bits. A nonzero result also
+// guarantees that no thread offset in the kernel wraps.
+inline uint64_t grid_coverage(uint32_t blocks, uint32_t threads, uint32_t per_thread) {
+  const uint64_t per_block = uint64_t(threads) * per_thread;  // at most 2^64 - 2^33 + 1
+  if (blocks == 0 || per_block > UINT64_MAX / blocks) return 0;
+  return per_block * blocks;
+}
 
 int hmac0e_alloc(HitBuffer* buf);
 void hmac0e_free(HitBuffer* buf);

@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "hmac0e.cuh"
+#include "launch_range.cuh"
 #include "hmac_kernel.cuh"
 
 namespace {
@@ -67,8 +68,14 @@ void usage(const char* argv0) {
       "The message is --prefix followed by the counter as 20 zero-padded decimal\n"
       "digits (the full 2^64 range, searched in 10^8 windows). The prefix length\n"
       "must satisfy ((len + 12) %% 64) <= 47 so the 8-digit counter slot and the\n"
-      "SHA-256 padding share one final block.\n",
-      argv0);
+      "SHA-256 padding share one final block.\n"
+      "\n"
+      "Exit status: 0 done, 1 CUDA or I/O failure (rerun to resume), 2 invalid\n"
+      "arguments, 3 a rerun cannot help. A launch records at most %u hits; status 3\n"
+      "means a launch overflowed that buffer or the CPU re-check (off with\n"
+      "--no-verify) rejected a reported digest. The checkpoint stays before that\n"
+      "batch.\n",
+      argv0, (unsigned)HMAC0E_MAX_HITS);
 }
 
 bool hex_decode(const std::string& in, std::vector<uint8_t>* out) {
@@ -294,17 +301,22 @@ bool checkpoint_read(const Options& o, uint64_t* next, bool allow_missing = fals
                  std::strerror(errno));
     return false;
   }
-  char line[4096];
   std::string key_hex, prefix_hex;
   uint64_t ck_next = 0, ck_digits = 0;
   bool have_key = false, have_prefix = false, have_next = false, have_digits = false;
   bool valid = true;
-  while (std::fgets(line, sizeof(line), f)) {
-    char* eq = std::strchr(line, '=');
-    if (!eq) continue;
-    *eq = '\0';
-    const std::string k(line);
-    std::string val(eq + 1);
+
+  // key_hex and prefix_hex are as long as the key and prefix, so a record has
+  // no fixed bound; getline grows its buffer to fit the full record.
+  char* buf = nullptr;
+  size_t cap = 0;
+  ssize_t len;
+  while ((len = getline(&buf, &cap, f)) >= 0) {
+    const std::string line(buf, size_t(len));
+    const size_t eq = line.find('=');
+    if (eq == std::string::npos) continue;
+    const std::string k = line.substr(0, eq);
+    std::string val = line.substr(eq + 1);
     while (!val.empty() && (val.back() == '\n' || val.back() == '\r')) val.pop_back();
     if (k == "key_hex") {
       key_hex = val;
@@ -320,6 +332,7 @@ bool checkpoint_read(const Options& o, uint64_t* next, bool allow_missing = fals
       if (!parse_u64(val.c_str(), &ck_next)) valid = false;
     }
   }
+  std::free(buf);
   const bool read_failed = std::ferror(f) != 0;
   const int closed = std::fclose(f);
   if (read_failed || closed != 0 || !valid || !have_key || !have_prefix || !have_next ||
@@ -365,19 +378,15 @@ double seconds_since(std::chrono::steady_clock::time_point t0) {
 }
 
 // The counter becomes the 20 zero-padded decimal digits appended to the
-// prefix. Within a window of 10^8 counters the leading 12 digits are fixed,
-// so one context build per window keeps the two-compression floor.
+// prefix, and a window of 10^8 counters fixes the leading 12 of them, so one
+// context build per window keeps the two-compression floor. The format itself
+// lives in hmac0e.cuh, shared with the test oracles.
 const uint64_t kWindow = HMAC0E_WINDOW;
 
-// Zero-padded decimal with exactly `width` digits; v must be < 10^width.
-std::string padded_dec(uint64_t v, unsigned width) {
-  std::string s(width, '0');
-  for (int i = int(width) - 1; i >= 0; --i) {
-    s[i] = char('0' + v % 10u);
-    v /= 10u;
-  }
-  return s;
-}
+// Exit status when a rerun with the same arguments cannot help: a hit buffer
+// overflow repeats at the same geometry, and a rejected device digest means
+// the device results are wrong. Status 1 (CUDA or I/O failure) is retryable.
+const int kExitNoRetry = 3;
 
 void report_line(uint64_t scanned, double secs, uint64_t hits) {
   const double rate = secs > 0 ? double(scanned) / secs : 0.0;
@@ -405,9 +414,7 @@ int main(int argc, char** argv) {
   HmacCtx ctx;
   const char* err = nullptr;
   auto build_window_ctx = [&](uint64_t window) -> bool {
-    std::vector<uint8_t> eff = o.prefix;
-    const std::string w12 = padded_dec(window, 12);
-    eff.insert(eff.end(), w12.begin(), w12.end());
+    const std::vector<uint8_t> eff = window_prefix(o.prefix, window);
     return hmac_ctx_build(o.key.data(), o.key.size(), eff.data(), eff.size(), &ctx, &err);
   };
   if (!build_window_ctx(0)) {
@@ -435,6 +442,15 @@ int main(int argc, char** argv) {
   }
   const uint32_t blocks = (o.blocks != 0) ? o.blocks : props.multiProcessorCount * blocks_per_sm;
 
+  // Checked once here: launch_range needs a coverage of at least 1, or an
+  // empty launch would advance nothing and spin forever.
+  const uint64_t coverage = grid_coverage(blocks, o.threads, o.per_thread);
+  if (coverage == 0) {
+    std::fprintf(stderr, "grid %u x %u x %u exceeds 2^64 counters per launch\n", blocks,
+                 o.threads, o.per_thread);
+    return 2;
+  }
+
   HitBuffer buf;
   if (hmac0e_alloc(&buf) != 0) return 1;
 
@@ -443,8 +459,7 @@ int main(int argc, char** argv) {
                "key %zu bytes, prefix %zu bytes, digits %u, body = prefix || 20 digits\n"
                "grid %u x %u, %u counters/thread -> %.3e per launch\n",
                o.device, props.name, props.multiProcessorCount, o.key.size(), o.prefix.size(),
-               o.digits, blocks, o.threads, o.per_thread,
-               double(uint64_t(blocks) * o.threads) * o.per_thread);
+               o.digits, blocks, o.threads, o.per_thread, double(coverage));
 
   std::vector<Hit> hits(HMAC0E_MAX_HITS);
   const auto t0 = std::chrono::steady_clock::now();
@@ -460,25 +475,16 @@ int main(int argc, char** argv) {
     if (o.count != 0 && scanned >= o.count) break;
     if (o.time_limit > 0 && seconds_since(t0) >= o.time_limit) break;
 
-    const uint64_t window = next / kWindow;
-    const uint64_t c0 = next % kWindow;
-    if (!build_window_ctx(window)) {
-      std::fprintf(stderr, "cannot build HMAC context for window %" PRIu64 ": %s\n", window, err);
+    const uint64_t count_left = (o.count == 0) ? 0 : o.count - scanned;
+    const LaunchRange r = launch_range(next, coverage, count_left);
+    if (!build_window_ctx(r.window)) {
+      std::fprintf(stderr, "cannot build HMAC context for window %" PRIu64 ": %s\n", r.window, err);
       rc = 1;
       break;
     }
 
-    // Counters left in the 2^64 space. 2^64 itself does not fit in a uint64,
-    // so next == 0 (the whole space) is represented as UINT64_MAX; the one
-    // missing counter can never be reached, since a launch covers at most
-    // kWindow candidates.
-    const uint64_t space = (next == 0) ? UINT64_MAX : (~next + 1);
-    const uint64_t avail = std::min(kWindow - c0, space);  // left in this window
-    uint64_t want = uint64_t(blocks) * o.threads * o.per_thread;
-    if (want > avail) want = avail;
-    if (o.count != 0 && want > o.count - scanned) want = o.count - scanned;
-
-    if (hmac0e_launch(ctx, c0, want, o.digits, blocks, o.threads, o.per_thread, &buf, 0) != 0) {
+    if (hmac0e_launch(ctx, r.c0, r.want, o.digits, blocks, o.threads, o.per_thread, &buf, 0) !=
+        0) {
       rc = 1;
       break;
     }
@@ -488,26 +494,30 @@ int main(int argc, char** argv) {
       rc = 1;
       break;
     }
-    const uint32_t take = (found < (uint32_t)hits.size()) ? found : (uint32_t)hits.size();
-    if (found > take) {
-      std::fprintf(stderr, "warning: hit buffer full, %u hits in this window lost\n",
-                   found - take);
+    if (found > hits.size()) {
+      // A rejected slot is a gap in the result set. Record nothing from this
+      // batch and leave the checkpoint before it, so a resumed run re-scans it
+      // with a smaller range instead of reporting a partial hit set.
+      std::fprintf(stderr,
+                   "hit buffer overflow: %" PRIu32 " hits in one launch, %zu slots;"
+                   " lower --blocks/--batch or raise --digits;"
+                   " checkpoint left before this batch\n",
+                   found, hits.size());
+      rc = kExitNoRetry;
+      break;
     }
 
-    for (uint32_t i = 0; i < take; ++i) {
-      const uint64_t g = window * kWindow + hits[i].counter;
-      std::string body(reinterpret_cast<const char*>(o.prefix.data()), o.prefix.size());
-      body += padded_dec(g, 20);
+    for (uint32_t i = 0; i < found; ++i) {
+      const uint64_t g = r.window * kWindow + hits[i].counter;
+      const std::string body = body_of(o.prefix, g);
       char digest[65];
       digest_to_hex(hits[i].digest, digest);
 
       bool ok = true;
       if (o.verify) {
-        std::vector<uint8_t> msg = o.prefix;
-        const std::string d20 = padded_dec(g, 20);
-        msg.insert(msg.end(), d20.begin(), d20.end());
         uint32_t want_digest[8] = {0};
-        hmac_sha256(o.key.data(), o.key.size(), msg.data(), msg.size(), want_digest);
+        hmac_sha256(o.key.data(), o.key.size(),
+                    reinterpret_cast<const uint8_t*>(body.data()), body.size(), want_digest);
         char check[65];
         digest_to_hex(want_digest, check);
         ok = std::strcmp(check, digest) == 0 && magic_ok(want_digest, o.digits);
@@ -531,13 +541,26 @@ int main(int argc, char** argv) {
         rc = 1;
         break;
       }
-      if (ok) ++total_hits;
+      if (ok) {
+        ++total_hits;
+      } else {
+        // The CPU re-check is the only integrity gate on a long unattended run.
+        // A digest the device reported that the reference HMAC rejects means no
+        // device result can be trusted, so stop with the checkpoint before this
+        // batch rather than scanning for hours and exiting 0.
+        std::fprintf(stderr,
+                     "verification failed for counter %" PRIu64
+                     "; checkpoint left before this batch\n",
+                     g);
+        rc = kExitNoRetry;
+        break;
+      }
     }
     if (rc != 0) break;
 
-    exhausted = next + want == 0;  // wrapped past the end of 2^64
-    next += want;
-    scanned += want;
+    exhausted = r.exhausted;
+    next += r.want;
+    scanned += r.want;
     if (exhausted) {
       std::fprintf(stderr, "counter space exhausted\n");
       break;

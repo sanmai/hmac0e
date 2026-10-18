@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "hmac0e.cuh"
+#include "launch_range.cuh"
 #include "hmac_kernel.cuh"
 
 static int g_checks = 0;
@@ -36,24 +37,10 @@ static std::vector<uint8_t> str(const char* s) {
 
 // The counter becomes the 20 zero-padded decimal digits appended to the
 // prefix, searched in 10^8 windows (the leading 12 digits are fixed per
-// window). See hmac0e.cuh.
+// window). body_of and window_prefix come from hmac0e.cuh, launch_range from
+// launch_range.cuh, so the oracle and the search cannot drift apart on the
+// body format.
 static const uint64_t kWindow = HMAC0E_WINDOW;
-
-static std::string padded_dec(uint64_t v, unsigned width) {
-  std::string s(width, '0');
-  for (int i = int(width) - 1; i >= 0; --i) {
-    s[i] = char('0' + v % 10u);
-    v /= 10u;
-  }
-  return s;
-}
-
-static std::vector<uint8_t> window_prefix(const std::vector<uint8_t>& p, uint64_t window) {
-  std::vector<uint8_t> eff = p;
-  const std::string w = padded_dec(window, 12);
-  eff.insert(eff.end(), w.begin(), w.end());
-  return eff;
-}
 
 // Independent oracle: full HMAC-SHA256 per counter over the true body, no
 // hoisting involved.
@@ -61,13 +48,11 @@ static std::vector<uint64_t> oracle_hits(const std::vector<uint8_t>& key,
                                          const std::vector<uint8_t>& prefix, uint64_t base,
                                          uint64_t n, unsigned digits) {
   std::vector<uint64_t> out;
-  std::vector<uint8_t> msg = prefix;
-  msg.resize(prefix.size() + 20);
   for (uint64_t i = 0; i < n; ++i) {
-    const std::string d20 = padded_dec(base + i, 20);
-    std::memcpy(msg.data() + prefix.size(), d20.data(), 20);
+    const std::string body = body_of(prefix, base + i);
     uint32_t d[8] = {0};
-    hmac_sha256(key.data(), key.size(), msg.data(), msg.size(), d);
+    hmac_sha256(key.data(), key.size(), reinterpret_cast<const uint8_t*>(body.data()),
+                body.size(), d);
     if (magic_ok(d, digits)) out.push_back(base + i);
   }
   return out;
@@ -78,13 +63,19 @@ static std::vector<uint64_t> oracle_hits(const std::vector<uint8_t>& key,
 static bool gpu_hits(const std::vector<uint8_t>& key, const std::vector<uint8_t>& prefix,
                      uint64_t base, uint64_t n, unsigned digits, uint32_t blocks,
                      uint32_t threads, uint32_t per_thread, std::vector<Hit>* out) {
+  // A coverage of 0 would make every launch empty and loop forever.
+  const uint64_t coverage = grid_coverage(blocks, threads, per_thread);
+  if (coverage == 0) {
+    check(false, "grid covers no counters");
+    return false;
+  }
   HitBuffer buf;
   if (hmac0e_alloc(&buf) != 0) return false;
   bool ok = true;
   uint64_t g = base, left = n;
   while (left > 0 && ok) {
-    const uint64_t window = g / kWindow;
-    const uint64_t c0 = g % kWindow;
+    const LaunchRange r = launch_range(g, coverage, left);
+    const uint64_t window = r.window;
     const std::vector<uint8_t> eff = window_prefix(prefix, window);
     HmacCtx ctx;
     const char* err = nullptr;
@@ -93,11 +84,7 @@ static bool gpu_hits(const std::vector<uint8_t>& key, const std::vector<uint8_t>
       ok = false;
       break;
     }
-    const uint64_t space = (g == 0) ? UINT64_MAX : (~g + 1); // left in 2^64
-    const uint64_t avail = std::min(kWindow - c0, space);    // left in this window
-    const uint64_t grid_cov = uint64_t(blocks) * threads * per_thread;
-    const uint64_t take = std::min({left, avail, grid_cov});
-    if (hmac0e_launch(ctx, c0, take, digits, blocks, threads, per_thread, &buf, 0) != 0) {
+    if (hmac0e_launch(ctx, r.c0, r.want, digits, blocks, threads, per_thread, &buf, 0) != 0) {
       ok = false;
       break;
     }
@@ -115,8 +102,8 @@ static bool gpu_hits(const std::vector<uint8_t>& key, const std::vector<uint8_t>
     }
     for (uint32_t i = 0; i < found; ++i)
       out->data()[at + i].counter = window * kWindow + out->data()[at + i].counter;
-    g += take;
-    left -= take;
+    g += r.want;
+    left -= r.want;
   }
   hmac0e_free(&buf);
   return ok;
@@ -138,11 +125,10 @@ static void compare_hit_sets(const std::string& label, const std::vector<uint8_t
   int bad_digest = 0;
   for (const Hit& h : got) {
     // Each reported digest must reproduce under the independent reference.
-    std::vector<uint8_t> msg = prefix;
-    const std::string d20 = padded_dec(h.counter, 20);
-    msg.insert(msg.end(), d20.begin(), d20.end());
+    const std::string body = body_of(prefix, h.counter);
     uint32_t d[8] = {0};
-    hmac_sha256(key.data(), key.size(), msg.data(), msg.size(), d);
+    hmac_sha256(key.data(), key.size(), reinterpret_cast<const uint8_t*>(body.data()),
+                body.size(), d);
     if (std::memcmp(d, h.digest, sizeof(d)) != 0) ++bad_digest;
     got_counters.push_back(h.counter);
   }

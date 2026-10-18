@@ -247,6 +247,43 @@ static void test_hits(const Options& o) {
   check(checkpoint_write(disabled, 0, 0), "optional checkpoint");
 }
 
+// The grid's reach is a product of three u32 options. It must not wrap: a
+// coverage of 0 would make every launch empty and spin the search forever, and
+// a wrapped thread offset in the kernel would re-scan counters.
+static void test_grid_coverage() {
+  check(grid_coverage(1020, 256, 512) == 133693440ull, "the default grid");
+  check(grid_coverage(1, 1, 1) == 1, "the smallest grid");
+  check(grid_coverage(0, 256, 512) == 0, "no blocks reach nothing");
+  check(grid_coverage(1u << 28, 256, 1u << 28) == 0, "exactly 2^64 is rejected, not wrapped to 0");
+  check(grid_coverage(UINT32_MAX, UINT32_MAX, UINT32_MAX) == 0, "a far overflow is rejected");
+  const uint64_t widest = uint64_t(UINT32_MAX) * UINT32_MAX;
+  check(grid_coverage(1, UINT32_MAX, UINT32_MAX) == widest, "the widest single block fits");
+}
+
+// key_hex and prefix_hex are as long as the key and prefix, so a record can
+// exceed any fixed read buffer; a split record used to read back as a different
+// search and refuse an otherwise resumable checkpoint.
+static void test_long_records(Options o) {
+  o.checkpoint += ".long";
+  const size_t sizes[] = {2043, 2044, 2045, 4095, 4096, 5000};
+  for (size_t n : sizes) {
+    Options big = o;
+    big.key.assign(n, uint8_t('k'));
+    big.prefix.assign(n, uint8_t('p'));
+    check(checkpoint_write(big, 777, 1), "write checkpoint with long hex records");
+    uint64_t next = 0;
+    check(checkpoint_read(big, &next) && next == 777, "resume across a record split");
+    Options other = big;
+    other.key.push_back('x');
+    next = 0;
+    check(!checkpoint_read(other, &next), "a long key still detects a mismatch");
+  }
+
+  write_file(o.checkpoint, "key_hex=\nprefix_hex=\ndigits=62\nnext=42");
+  uint64_t next = 0;
+  check(checkpoint_read(o, &next) && next == 42, "read a final record with no newline");
+}
+
 int main() {
   // mkdtemp gives each invocation its own files, left available for inspection.
   if (mkdir("tmp", 0777) != 0 && errno != EEXIST) return 1;
@@ -257,7 +294,9 @@ int main() {
   o.hits_file = std::string(path) + "/hits";
   test_numbers();
   test_key_required();
+  test_grid_coverage();
   test_checkpoints(o);
+  test_long_records(o);
   test_auto_resume(o);
   test_write_failures(o);
   test_hits(o);

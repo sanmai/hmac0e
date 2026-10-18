@@ -36,9 +36,8 @@ __global__ __launch_bounds__(256) void search_kernel(const HmacCtx ctx, uint64_t
   const uint64_t tid = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
   const uint64_t off = tid * per_thread;
   if (off >= n) return;
-  // The counter space is mod 2^64, so [base, base+n) wraps naturally past
-  // 0xffffffffffffffff. Count, not limit, bounds the loop: a precomputed
-  // base+n would wrap to 0 and kill the tail of the search.
+  // base and n are window-local, so base + n <= HMAC0E_WINDOW and c never
+  // wraps; the host maps window-local counters to global ones.
   const uint64_t count = min(uint64_t(per_thread), n - off);
   uint64_t c = base + off;
 
@@ -108,11 +107,12 @@ int hmac0e_launch(const HmacCtx& ctx, uint64_t base, uint64_t n, unsigned digits
                  base, n, HMAC0E_WINDOW);
     return 1;
   }
-  if (n > uint64_t(blocks) * threads * per_thread) {
+  const uint64_t coverage = grid_coverage(blocks, threads, per_thread);
+  if (n > coverage) {
     std::fprintf(stderr,
-                 "hmac0e_launch: range of %" PRIu64
-                 " exceeds grid coverage of %llu; raise blocks/threads/per_thread\n",
-                 n, (unsigned long long)(uint64_t(blocks) * threads * per_thread));
+                 "hmac0e_launch: range of %" PRIu64 " exceeds grid coverage of %" PRIu64
+                 " (0: the grid is empty or exceeds 2^64 counters)\n",
+                 n, coverage);
     return 1;
   }
   HMAC0E_CHECK(cudaMemsetAsync(buf->nhits, 0, sizeof(uint32_t), stream));
