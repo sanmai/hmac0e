@@ -445,9 +445,11 @@ int main(int argc, char** argv) {
 
   std::vector<Hit> hits(HMAC0E_MAX_HITS);
   const auto t0 = std::chrono::steady_clock::now();
+  auto last_ckpt = t0 - std::chrono::seconds(1);  // first batch checkpoints immediately
   double next_report = o.progress;
   uint64_t scanned = 0;
   uint64_t total_hits = 0;
+  bool exhausted = false;
   int rc = 0;
 
   while (true) {
@@ -530,16 +532,24 @@ int main(int argc, char** argv) {
     }
     if (rc != 0) break;
 
-    const bool exhausted = next + want == 0;  // wrapped past the end of 2^64
+    exhausted = next + want == 0;  // wrapped past the end of 2^64
     next += want;
     scanned += want;
     if (exhausted) {
       std::fprintf(stderr, "counter space exhausted\n");
       break;
     }
-    if (!checkpoint_write(o, next, scanned)) {
-      rc = 1;
-      break;
+    // Checkpoint about once per second rather than per launch: a launch
+    // finishes in a few milliseconds, and each checkpoint is an
+    // open/write/close/rename. A crash or Ctrl+C re-scans at most the last
+    // second of candidates.
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_ckpt >= std::chrono::seconds(1)) {
+      if (!checkpoint_write(o, next, scanned)) {
+        rc = 1;
+        break;
+      }
+      last_ckpt = now;
     }
 
     if (o.progress > 0) {
@@ -550,6 +560,11 @@ int main(int argc, char** argv) {
       }
     }
   }
+
+  // Persist the final state even when the run ends less than a second after
+  // the last timed write. A wrapped counter must never be written: resume
+  // would read next == 0 as "start from the beginning" and rescan all of 2^64.
+  if (!exhausted && !checkpoint_write(o, next, scanned)) rc = 1;
 
   if (o.progress > 0) std::fprintf(stderr, "\n");
   const double secs = seconds_since(t0);
