@@ -1,0 +1,17 @@
+title: HMAC-SHA256 PHP magic hash
+description: >-
+  Here's a known HMAC-SHA256 magic hash (0e followed by digits) for PHP tests that
+  catch loose == comparisons. A CUDA tool to find more like this is included.
+lang: en
+author: Alexey Kopytko
+theme: jekyll-theme-primer
+
+plugins:
+  - jekyll-relative-links
+  - jekyll-seo-tag
+
+exclude:
+  - Makefile
+  - include/
+  - src/
+  - tests/
