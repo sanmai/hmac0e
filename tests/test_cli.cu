@@ -90,10 +90,16 @@ static void test_numbers() {
 static void test_key_required() {
   const char* no_key[] = {"hmac0e", "--prefix", "magic-hash-"};
   check(hmac0e_main(3, const_cast<char**>(no_key)) == 2, "reject missing key");
+  // An explicit empty key is a valid HMAC key. Parse directly: accepting the
+  // args would let hmac0e_main proceed to the CUDA context.
   const char* empty_key[] = {"hmac0e", "--key", ""};
-  check(hmac0e_main(3, const_cast<char**>(empty_key)) == 2, "reject empty --key");
+  Options o;
+  check(parse_args(3, const_cast<char**>(empty_key), &o) && o.key.empty() && o.have_key,
+        "accept explicit empty --key");
   const char* empty_hex[] = {"hmac0e", "--key-hex", ""};
-  check(hmac0e_main(3, const_cast<char**>(empty_hex)) == 2, "reject empty --key-hex");
+  Options o2;
+  check(parse_args(3, const_cast<char**>(empty_hex), &o2) && o2.key.empty() && o2.have_key,
+        "accept explicit empty --key-hex");
 }
 
 static void test_checkpoints(Options o) {
