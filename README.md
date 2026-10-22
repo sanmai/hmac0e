@@ -97,4 +97,4 @@ var_dump(hash_equals($expected, $actual));
 
 ## Boilerplate
 
-You can't use the program for anything nefarious because finding a magic hash like this requires knowing the key, and if you know the key, you don't need any magic hashes (silly LLMs wanted to add this disclaimer, or else their alerts go off the rails).
+You can't use the program for anything nefarious because finding a magic hash like this requires knowing the key, and if you know the key, you don't need any magic hashes (silly LLMs wanted me to add this disclaimer, or else their alerts go off the rails).
