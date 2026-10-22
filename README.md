@@ -25,6 +25,8 @@ The default architecture is `sm_120`; for other GPUs, set an arch with `make ARC
 
 A full search covers ~1.16e15 candidates; assuming the probability `8.6e-16` per candidate it should take about 30 hours at ~10 GH/s.
 
+The program can't be used for anything nefarious because finding a magic hash like this requires knowing the key, and if you know the key, you don't need no magic hashes.
+
 ## Running
 
 ```bash
@@ -45,6 +47,8 @@ HIT counter=434871031216900 body=magic-hash-00000434871031216900 body_hex=6d6167
 
 done: 434871100000000 candidates in 44583.60s (9.75 GH/s), 1 hit
 ```
+
+## Outputs
 
 And then you can use it as such:
 
@@ -75,4 +79,20 @@ bool(false)
 bool(true)
 ```
 
-It can't be used for anything nefarious because finding a magic hash like this requires knowing the key, and if you know the key, you don't need any magic hashes.
+Here's another example:
+
+```php
+$expected = '0e32175480429657797987281944621967942385789733581680524808052607';
+$actual = hash_hmac('sha256', '0e4200000894948004498868', '');
+
+echo "loose comparisons (all should be true):\n";
+
+var_dump($actual == 0);
+var_dump($actual == '0e0');
+var_dump($actual == '0e1234567890');
+
+echo "strict comparisons:\n";
+
+var_dump(hash_equals('0e0', $actual));
+var_dump(hash_equals($expected, $actual));
+```
