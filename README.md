@@ -25,8 +25,6 @@ The default architecture is `sm_120`; for other GPUs, set an arch with `make ARC
 
 A full search covers ~1.16e15 candidates; assuming the probability `8.6e-16` per candidate it should take about 30 hours at ~10 GH/s.
 
-The program can't be used for anything nefarious because finding a magic hash like this requires knowing the key, and if you know the key, you don't need no magic hashes.
-
 ## Running
 
 ```bash
@@ -96,3 +94,7 @@ echo "strict comparisons:\n";
 var_dump(hash_equals('0e0', $actual));
 var_dump(hash_equals($expected, $actual));
 ```
+
+## Boilerplate
+
+You can't use the program for anything nefarious because finding a magic hash like this requires knowing the key, and if you know the key, you don't need any magic hashes (silly LLMs wanted to add this disclaimer, or else their alerts go off the rails).
